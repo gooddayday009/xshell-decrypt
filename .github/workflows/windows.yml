@@ -1,0 +1,101 @@
+name: Windows build and release
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 35
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt --component clippy --no-self-update
+          if ($LASTEXITCODE -ne 0) { throw 'Rust installation failed' }
+          rustup default stable
+          if ($LASTEXITCODE -ne 0) { throw 'Rust selection failed' }
+          rustc --version
+      - name: Validate release tag
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          $metadata = (cargo metadata --no-deps --format-version 1 --locked) | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0) { throw 'Metadata failed' }
+          $version = ($metadata.packages | Where-Object name -EQ 'xdecrypt-rust').version
+          if ($env:RELEASE_TAG -cne "v$version") { throw 'Tag must match Cargo.toml version' }
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Test
+        run: cargo test --locked
+      - name: Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Install NSIS
+        run: |
+          $nsis = Join-Path ${env:ProgramFiles(x86)} 'NSIS\makensis.exe'
+          if (-not (Test-Path -LiteralPath $nsis)) {
+            choco install nsis --version=3.11 --yes --no-progress
+            if ($LASTEXITCODE -ne 0) { throw 'NSIS installation failed' }
+          }
+      - name: Build installer and archives
+        run: ./packaging/build.ps1
+      - name: Verify package hashes
+        run: |
+          foreach ($line in Get-Content -LiteralPath dist/SHA256SUMS.txt) {
+            $hash, $name = $line -split '  ', 2
+            $actual = (Get-FileHash -LiteralPath (Join-Path dist $name) -Algorithm SHA256).Hash
+            if ($actual -ine $hash) { throw "Hash mismatch: $name" }
+          }
+      - name: Upload Windows packages
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: windows-x64-${{ github.sha }}
+          path: |
+            dist/*-setup.exe
+            dist/*-portable.zip
+            dist/*-source.zip
+            dist/SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 30
+
+  release:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: windows-x64-${{ github.sha }}
+          path: dist
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" dist/* --clobber
+          else
+            gh release create "$RELEASE_TAG" dist/* --verify-tag --generate-notes --title "Xdecrypt Rust $RELEASE_TAG"
+          fi

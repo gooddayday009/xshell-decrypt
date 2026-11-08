@@ -1,0 +1,20 @@
+[package]
+name = "xdecrypt-rust"
+version = "1.1.0"
+edition = "2024"
+rust-version = "1.95"
+description = "Offline recovery of explicitly selected Xshell/Xftp session files"
+
+[dependencies]
+base64 = "=0.22.1"
+sha2 = "=0.10.9"
+zeroize = "=1.9.1"
+encoding_rs = "=0.8.42"
+eframe = { version = "=0.37.0", default-features = false, features = ["default_fonts", "glow", "clipboard"] }
+rfd = "=0.17.2"
+zip = { version = "=2.6.1", default-features = false, features = ["deflate"] }
+
+[profile.release]
+strip = true
+lto = "thin"
+codegen-units = 1
