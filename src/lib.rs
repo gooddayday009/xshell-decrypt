@@ -4,7 +4,15 @@ use std::{collections::HashMap, fs::File, io::Read, path::Path};
 use zeroize::{Zeroize, Zeroizing};
 
 pub mod discovery;
+pub mod export;
 pub mod imports;
+
+pub fn matches_query(query: &str, source: &str, detail: &str) -> bool {
+    let haystack = format!("{source}\n{detail}").to_lowercase();
+    query
+        .split_whitespace()
+        .all(|word| haystack.contains(&word.to_lowercase()))
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum Version {
@@ -170,17 +178,7 @@ pub fn decrypt(
     {
         return Err("请输入原 Windows 账户 SID，例如 S-1-5-21-…".into());
     }
-    let compact: String = encoded
-        .chars()
-        .filter(|c| !c.is_ascii_whitespace())
-        .collect();
-    let payload = STANDARD
-        .decode(&compact)
-        .map_err(|_| "Password 不是有效的 Base64".to_string())?;
-    if payload.len() < 32 {
-        return Err("密码数据过短，缺少校验值".into());
-    }
-    let (cipher, expected) = payload.split_at(payload.len() - 32);
+    let payload = decode_payload(encoded)?;
     let candidates: &[bool] = match version {
         Version::Auto => &[true, false],
         Version::V6 => &[false],
@@ -192,26 +190,62 @@ pub fn decrypt(
         } else {
             format!("{user}{sid}")
         });
-        let mut key = Sha256::digest(material.as_bytes());
-        let mut plain = Zeroizing::new(cipher.to_vec());
-        rc4(&key, &mut plain);
-        key.as_mut_slice().zeroize();
-        let mut actual = Sha256::digest(&*plain);
-        let difference = actual
-            .iter()
-            .zip(expected)
-            .fold(0u8, |acc, (a, b)| acc | (a ^ b));
-        actual.as_mut_slice().zeroize();
-        if difference == 0 {
-            let s = std::str::from_utf8(&plain)
-                .map_err(|_| "校验通过，但密码不是 UTF-8，无法安全显示".to_string())?;
-            return Ok((
-                Zeroizing::new(s.to_owned()),
-                if *modern { "7 / 8" } else { "6" },
-            ));
+        if let Some(plain) = decrypt_payload(&payload, &material)? {
+            return Ok((plain, if *modern { "7 / 8" } else { "6" }));
         }
     }
-    Err("校验未通过：请检查原账户用户名、SID 和版本；主密码保护或其他加密格式暂不支持".into())
+    Err("校验未通过：请检查原账户用户名、SID 和版本；若设置过主密码，请切换到主密码模式；也可能是其他加密格式".into())
+}
+
+/// Decrypt with the explicitly supplied master password, without OS account data.
+pub fn decrypt_master(
+    encoded: &str,
+    master: &str,
+) -> Result<(Zeroizing<String>, &'static str), String> {
+    if master.is_empty() {
+        return Err("请输入保存会话时设置的主密码".into());
+    }
+    let payload = decode_payload(encoded)?;
+    decrypt_payload(&payload, master)?
+        .map(|plain| (plain, "主密码"))
+        .ok_or_else(|| {
+            "主密码校验未通过：请检查主密码是否与保存/导出时一致；文件也可能损坏或使用其他加密格式"
+                .into()
+        })
+}
+
+fn decode_payload(encoded: &str) -> Result<Vec<u8>, String> {
+    let compact: String = encoded
+        .chars()
+        .filter(|c| !c.is_ascii_whitespace())
+        .collect();
+    let payload = STANDARD
+        .decode(&compact)
+        .map_err(|_| "Password 不是有效的 Base64".to_string())?;
+    if payload.len() < 32 {
+        return Err("密码数据过短，缺少校验值".into());
+    }
+    Ok(payload)
+}
+
+fn decrypt_payload(payload: &[u8], material: &str) -> Result<Option<Zeroizing<String>>, String> {
+    let (cipher, expected) = payload.split_at(payload.len() - 32);
+    let mut key = Sha256::digest(material.as_bytes());
+    let mut plain = Zeroizing::new(cipher.to_vec());
+    rc4(&key, &mut plain);
+    key.as_mut_slice().zeroize();
+    let mut actual = Sha256::digest(&*plain);
+    let difference = actual
+        .iter()
+        .zip(expected)
+        .fold(0u8, |acc, (a, b)| acc | (a ^ b));
+    actual.as_mut_slice().zeroize();
+    if difference != 0 {
+        return Ok(None);
+    }
+    let text = std::str::from_utf8(&plain)
+        .map_err(|_| "校验通过，但密码不是 UTF-8，无法安全显示".to_string())?;
+    Ok(Some(Zeroizing::new(text.to_owned())))
 }
 
 #[cfg(test)]
@@ -221,6 +255,47 @@ mod tests {
     const SID: &str = "S-1-5-21-111-222-333-1001";
     const V6: &str = "dwYgTON5q9d31mUVmQAzuaBbjSI1KS1WUG5wxQnIsMdYVc/SCociM+/tT/mssBD6Sg==";
     const V78: &str = "D42FwExKSic5o7ezZURg87xbjSI1KS1WUG5wxQnIsMdYVc/SCociM+/tT/mssBD6Sg==";
+    #[test]
+    fn search_matches_ip_name_user_and_combined_words() {
+        let path = "sessions/后台/Production.xsh";
+        let detail = "192.0.2.12:22 · 登录用户 admin";
+        for query in [
+            "",
+            "后台",
+            "production",
+            "192.0.2",
+            "ADMIN",
+            "后台 192.0.2 admin",
+        ] {
+            assert!(matches_query(query, path, detail));
+        }
+        assert!(!matches_query("192.0.2 missing", path, detail));
+    }
+    #[test]
+    fn published_master_password_vector() {
+        let encoded = "Rrm3P3AL0iDV7nBbS2bHvh7ZAvuN1NSJl8ZFL11+UJ+82+KAixa89O3OTAfRTg==";
+        assert_eq!(
+            decrypt_master(encoded, "123123").unwrap().0.as_str(),
+            "This is a test"
+        );
+        assert!(decrypt_master(encoded, "wrong").is_err());
+        assert!(decrypt_master(encoded, "").is_err());
+        assert!(decrypt_master("not base64", "123123").is_err());
+    }
+    #[test]
+    fn master_preserves_unicode_and_whitespace() {
+        // Independently generated with Python hashlib + PyCryptodome, including spaces.
+        let encoded = "v4eI0W4Tn9eBCsbUYN0SQEFbjSI1KS1WUG5wxQnIsMdYVc/SCociM+/tT/mssBD6Sg==";
+        assert_eq!(
+            decrypt_master(encoded, " 主密码-Test! ")
+                .unwrap()
+                .0
+                .as_str(),
+            "Test-only_密码!"
+        );
+        assert!(decrypt_master(encoded, "主密码-Test!").is_err());
+        assert!(decrypt(encoded, USER, SID, Version::Auto).is_err());
+    }
     // Independent vectors generated using Python hashlib + PyCryptodome ARC4.
     #[test]
     fn python_compatibility_vectors() {

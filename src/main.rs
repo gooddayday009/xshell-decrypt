@@ -3,9 +3,11 @@
 use eframe::egui;
 use std::{path::PathBuf, sync::mpsc, time::Duration};
 use xdecrypt_rust::{
-    Version, decrypt,
+    Version, decrypt, decrypt_master,
     discovery::{self, Discovery},
+    export::{ExportEntry, save_txt},
     imports::{MAX_SESSIONS, read_source},
+    matches_query,
 };
 use zeroize::Zeroizing;
 
@@ -27,6 +29,10 @@ struct App {
     user: String,
     sid: String,
     version: Version,
+    use_master: bool,
+    master: Zeroizing<String>,
+    show_master: bool,
+    query: String,
     rows: Vec<Row>,
     status: String,
     pending: Option<mpsc::Receiver<JobResult>>,
@@ -126,6 +132,11 @@ impl App {
         let user = self.user.clone();
         let sid = self.sid.clone();
         let version = self.version;
+        let master = if self.use_master {
+            Some(self.master.clone())
+        } else {
+            None
+        };
         let (send, receive) = mpsc::channel();
         self.pending = Some(receive);
         self.status = "正在读取并校验所选文件…".into();
@@ -167,7 +178,11 @@ impl App {
                                     &session.version
                                 }
                             );
-                            (detail, decrypt(&session.encrypted, &user, &sid, version))
+                            let result = match &master {
+                                Some(password) => decrypt_master(&session.encrypted, password),
+                                None => decrypt(&session.encrypted, &user, &sid, version),
+                            };
+                            (detail, result)
                         }
                         Err(e) => (String::new(), Err(e)),
                     };
@@ -181,6 +196,43 @@ impl App {
             }
             let _ = send.send(JobResult::Recovered(rows));
         });
+    }
+
+    fn export(&mut self) {
+        let entries: Vec<_> = self
+            .rows
+            .iter()
+            .filter(|row| matches_query(&self.query, &row.path, &row.detail))
+            .filter_map(|row| {
+                row.result
+                    .as_ref()
+                    .ok()
+                    .map(|(password, algorithm)| ExportEntry {
+                        source: &row.path,
+                        detail: &row.detail,
+                        algorithm,
+                        password,
+                    })
+            })
+            .collect();
+        if entries.is_empty() {
+            self.status = "当前筛选没有成功恢复的结果可导出。".into();
+            return;
+        }
+        if let Some(mut path) = rfd::FileDialog::new()
+            .set_title("导出当前筛选的成功结果（含明文密码）")
+            .set_file_name("xdecrypt-results.txt")
+            .add_filter("TXT 文本文档", &["txt"])
+            .save_file()
+        {
+            if path.extension().is_none() {
+                path.set_extension("txt");
+            }
+            self.status = match save_txt(&path, &entries) {
+                Ok(()) => format!("已导出 {} 条成功结果：{}", entries.len(), path.display()),
+                Err(e) => e,
+            };
+        }
     }
 }
 
@@ -226,6 +278,7 @@ impl eframe::App for App {
             }
         }
         if !ui.ctx().input(|i| i.focused) {
+            self.show_master = false;
             for row in &mut self.rows {
                 row.visible = false;
             }
@@ -245,7 +298,7 @@ impl eframe::App for App {
                             if paths.len() > MAX_SESSIONS { self.status = "每次最多选择 1000 个文件，请重新选择。".into(); }
                             else { self.paths = paths; self.rows.clear(); self.status = format!("已选择 {} 个文件，填写原 Windows 账户信息后开始恢复。", self.paths.len()); }
                         }
-                    if ui.button("清空").clicked() { self.paths.clear(); self.rows.clear(); self.status = "已清空所选文件与恢复结果。".into(); }
+                    if ui.button("清空").clicked() { self.paths.clear(); self.rows.clear(); self.master = Zeroizing::new(String::new()); self.query.clear(); self.status = "已清空所选文件、主密码与恢复结果。".into(); }
                     ui.label(format!("已选 {} 个", self.paths.len()));
                 });
                 ui.small("启动自动发现当前用户 Documents 下 NetSarang Computer 的 6 / 7 / 8 目录。自定义路径请用“搜索目录…”。");
@@ -253,9 +306,21 @@ impl eframe::App for App {
                     egui::ScrollArea::vertical().max_height(110.).show(ui, |ui| { for path in &self.paths { ui.label(path.display().to_string()); } });
                 });
                 ui.separator();
-                ui.label(egui::RichText::new("原 Windows 账户信息").strong());
-                ui.label("使用保存会话时的 Windows 用户名与 SID；不是服务器登录账号。迁移文件请填写原电脑的信息。");
                 let mut changed = false;
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("解密方式").strong());
+                    changed |= ui.selectable_value(&mut self.use_master,false,"Windows 账户").changed();
+                    changed |= ui.selectable_value(&mut self.use_master,true,"主密码").changed();
+                });
+                if self.use_master {
+                    ui.label("输入保存或导出会话时设置的主密码；此模式不需要 Windows 用户名和 SID。");
+                    ui.horizontal(|ui| {
+                        ui.label("主密码");
+                        changed |= ui.add(egui::TextEdit::singleline(&mut *self.master).password(!self.show_master).desired_width(400.)).changed();
+                        ui.checkbox(&mut self.show_master,"显示");
+                    });
+                } else {
+                ui.label("使用保存会话时的 Windows 用户名与 SID；不是服务器登录账号。迁移文件请填写原电脑的信息。");
                 egui::Grid::new("identity").num_columns(2).spacing([16.,10.]).show(ui, |ui| {
                     ui.label("Windows 用户名");
                     changed |= ui.add(egui::TextEdit::singleline(&mut self.user).desired_width(470.).hint_text("例如 Administrator，不含计算机名\\ 前缀")).changed(); ui.end_row();
@@ -267,16 +332,32 @@ impl eframe::App for App {
                 if ui.button("填入当前 Windows 账户").clicked() {
                     match current_identity() { Ok((user,sid)) => { self.user = user; self.sid = sid; changed = true; self.status = "已填入当前 Windows 账户。".into(); }, Err(e) => self.status = e }
                 }
+                }
                 if changed { self.rows.clear(); }
                 ui.add_space(4.);
-                if ui.add_enabled(!self.paths.is_empty() && !self.user.trim().is_empty() && !self.sid.trim().is_empty(), egui::Button::new(egui::RichText::new("开始恢复").strong()).fill(egui::Color32::from_rgb(174,225,211))).clicked() { self.start(); }
+                let ready = !self.paths.is_empty() && if self.use_master { !self.master.is_empty() } else { !self.user.trim().is_empty() && !self.sid.trim().is_empty() };
+                if ui.add_enabled(ready, egui::Button::new(egui::RichText::new("开始恢复").strong()).fill(egui::Color32::from_rgb(174,225,211))).clicked() { self.start(); }
             });
             ui.separator();
             ui.label(&self.status);
-            ui.small("7 / 8 共用密钥规则；Xshell 8 已完成算法测试，真实会话兼容性待验证。主密码保护与认证配置文件暂不支持。");
+            ui.small("已支持 Windows 账户和已知主密码规则；真实 Xshell 8 主密码会话仍待验收，认证配置文件暂不支持。");
             ui.add_space(4.);
+            ui.horizontal(|ui| {
+                ui.label("搜索结果");
+                ui.add(egui::TextEdit::singleline(&mut self.query).hint_text("IP / 会话名字 / 登录用户名；空格分隔多个关键词").desired_width(450.));
+                if ui.button("清除搜索").clicked() { self.query.clear(); }
+            });
+            let filtered = self.rows.iter().filter(|r| matches_query(&self.query,&r.path,&r.detail));
+            let shown = filtered.clone().count();
+            let successes = filtered.filter(|r| r.result.is_ok()).count();
+            ui.horizontal_wrapped(|ui| {
+                ui.label(format!("显示 {shown} / {} 条，成功 {successes} 条", self.rows.len()));
+                if ui.add_enabled(successes > 0 && self.pending.is_none(),egui::Button::new("导出当前结果 TXT…")).clicked() { self.export(); }
+                ui.small("仅导出筛选中的成功结果，包含明文密码。");
+            });
             egui::ScrollArea::vertical().auto_shrink([false,false]).show(ui, |ui| {
                 for row in &mut self.rows {
+                    if !matches_query(&self.query,&row.path,&row.detail) { row.visible = false; continue; }
                     ui.group(|ui| {
                         ui.label(egui::RichText::new(row.path.rsplit(['/', '\\']).next().unwrap_or(&row.path)).strong());
                         ui.small(&row.path);
@@ -301,8 +382,8 @@ fn main() -> eframe::Result {
         "Xdecrypt Rust",
         eframe::NativeOptions {
             viewport: egui::ViewportBuilder::default()
-                .with_inner_size([870., 730.])
-                .with_min_inner_size([680., 560.]),
+                .with_inner_size([900., 840.])
+                .with_min_inner_size([760., 760.]),
             renderer: eframe::Renderer::Glow,
             ..Default::default()
         },
